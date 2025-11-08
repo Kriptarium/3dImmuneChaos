@@ -4,12 +4,12 @@ import os, zipfile, tempfile, json
 import numpy as np
 import pandas as pd
 
-from preprocess_core import group_multichannel, process_entry
+from preprocess_core import group_multichannel, process_entry, is_junk_mac
 from chaos_metrics import lyapunov_rosenstein, higuchi_fd
 from report_utils import save_simple_pdf
 
 st.set_page_config(page_title="3dImmuneChaos", layout="wide")
-st.title("3dImmuneChaos — Çok Kanallı Ön İşleme + Kaotik Metrikler (Patched)")
+st.title("3dImmuneChaos — Çok Kanallı Ön İşleme + Kaotik Metrikler (Patch 2)")
 
 with st.sidebar:
     st.header("Genel Ayarlar")
@@ -26,6 +26,12 @@ if "overlays" not in st.session_state:
 if "debug" not in st.session_state:
     st.session_state.debug = []
 
+def is_valid_image_name(name):
+    name = name.lower()
+    if name.startswith("._") or name.startswith("."):
+        return False
+    return name.endswith((".png",".tif",".tiff",".jpg",".jpeg"))
+
 with tabs[0]:
     st.subheader("Veri yükle")
     mode = st.radio("Yükleme yöntemi", ["ZIP (önerilir)", "Tekil dosyalar"])
@@ -35,8 +41,10 @@ with tabs[0]:
     def _collect_images(base):
         cnt = 0
         for rootd, dirs, files in os.walk(base):
+            if "__MACOSX" in rootd:
+                continue
             for name in files:
-                if name.lower().endswith((".png",".tif",".tiff",".jpg",".jpeg")):
+                if is_valid_image_name(name):
                     all_files.append(os.path.join(rootd, name))
                     cnt += 1
         return cnt
@@ -51,7 +59,7 @@ with tabs[0]:
                 with zipfile.ZipFile(zpath, "r") as z:
                     z.extractall(work_dir)
                 cnt = _collect_images(work_dir)
-                st.info(f"{cnt} görüntü algılandı.")
+                st.info(f"{cnt} görüntü algılandı (macOS ._ / __MACOSX dosyaları otomatik atlandı).")
             except Exception as e:
                 st.error(f"ZIP açılamadı: {e}")
     else:

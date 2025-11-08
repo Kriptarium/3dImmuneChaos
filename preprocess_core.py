@@ -3,6 +3,7 @@ import os, re
 import numpy as np
 from skimage import io, filters, morphology, measure, segmentation, exposure, util
 from skimage.restoration import rolling_ball
+from scipy import ndimage as ndi  # for binary_fill_holes
 
 def _to_gray(arr):
     if arr.ndim == 3:
@@ -24,7 +25,8 @@ def autoseg_from_phase(img):
     bw = blur > th
     bw = morphology.remove_small_objects(bw, min_size=2000)
     bw = morphology.binary_closing(bw, morphology.disk(5))
-    bw = morphology.binary_fill_holes(bw)
+    # replace morphology.binary_fill_holes -> ndi.binary_fill_holes
+    bw = ndi.binary_fill_holes(bw)
     return bw
 
 def rim_core(mask, rim_px=20):
@@ -58,12 +60,15 @@ def texture_index(img, mask):
     mean = float(np.mean(vals)) if np.mean(vals)>0 else np.nan
     return float(var/mean) if (mean and np.isfinite(mean)) else float("nan")
 
-# ---------- MULTI-CHANNEL GROUPING ----------
 ROLE_PATTERNS = {
     "dapi": re.compile(r"(dapi|hoechst|nuc(lei|clear)?)", re.I),
     "immune": re.compile(r"(cd3|cd8|immune|t[-_ ]?cell|tcell)", re.I),
     "tumor": re.compile(r"(phase|bf|bright|tumor|ck|actin)", re.I),
 }
+
+def is_junk_mac(path):
+    name = os.path.basename(path)
+    return ("__MACOSX" in path) or name.startswith("._") or name.startswith(".")
 
 def guess_role_from_name(name):
     for role, pat in ROLE_PATTERNS.items():
@@ -72,7 +77,6 @@ def guess_role_from_name(name):
     return "unknown"
 
 def canonical_stem(name):
-    # remove role tokens to derive a common stem
     tokens = ["dapi","hoechst","nuclei","nuclear","nuc","cd3","cd8","immune","tcell","t-cell","phase","bf","bright","tumor","ck","actin"]
     s = name.lower()
     for t in tokens:
@@ -83,6 +87,8 @@ def canonical_stem(name):
 def group_multichannel(files):
     groups = {}
     for p in files:
+        if is_junk_mac(p):
+            continue
         base = os.path.splitext(os.path.basename(p))[0]
         role = guess_role_from_name(base)
         stem = canonical_stem(base)
@@ -92,7 +98,6 @@ def group_multichannel(files):
             g[role] = p
     return groups
 
-# ---------- PROCESS ONE ENTRY ----------
 def safe_imread(path):
     if path is None:
         raise ValueError("No path provided")
@@ -100,6 +105,9 @@ def safe_imread(path):
         path = str(path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"File not found: {path}")
+    # reject mac resource files early
+    if is_junk_mac(path):
+        raise IOError(f"Junk macOS resource file: {path}")
     img = io.imread(path)
     if img is None:
         raise IOError(f"Failed to read: {path}")
@@ -122,12 +130,10 @@ def overlay_png(base_img, mask, rim, dpi=200):
     return buf.read()
 
 def process_entry(entry, px_per_micron, rim_width_microns, prefer_channel="tumor"):
-    # choose base channel
     base_path = entry.get(prefer_channel) or entry.get("tumor") or (entry.get("all")[0] if entry.get("all") else None)
     if base_path is None:
         raise ValueError("No valid image found for this group (missing base channel).")
     img = safe_imread(base_path)
-    from skimage import util as _util, filters, measure
     base_img = _to_gray(img)
     base_img_bs = background_subtract(base_img, radius_px=int(50/px_per_micron))
 
@@ -145,7 +151,7 @@ def process_entry(entry, px_per_micron, rim_width_microns, prefer_channel="tumor
 
     immune_boundary = immune_core = immune_infiltration = np.nan
     radial_immune = None
-    if "immune" in entry:
+    if "immune" in entry and not is_junk_mac(entry["immune"]):
         try:
             im = safe_imread(entry["immune"])
             im = _to_gray(im)
@@ -158,7 +164,7 @@ def process_entry(entry, px_per_micron, rim_width_microns, prefer_channel="tumor
             pass
 
     nuclei_count = nuclei_density = np.nan
-    if "dapi" in entry:
+    if "dapi" in entry and not is_junk_mac(entry["dapi"]):
         try:
             d = safe_imread(entry["dapi"])
             d = _to_gray(d)
