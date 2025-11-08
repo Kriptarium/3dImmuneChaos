@@ -82,35 +82,3 @@ def higuchi_fd(ts, kmax=10):
     coeff, *_ = np.linalg.lstsq(A, logL, rcond=None)
     fd = coeff[0]
     return float(fd)
-
-def boxcount_fd_binary(mask):
-    import numpy as np
-    from skimage import segmentation
-    mask = mask.astype(bool)
-    if mask.sum() == 0:
-        return np.nan
-    B = segmentation.find_boundaries(mask, mode="outer").astype(np.uint8)
-    sizes, counts = [], []
-    n = min(mask.shape)
-    s = 2
-    max_scales = 0
-    while s <= n:
-        cnt = 0
-        for i in range(0, mask.shape[0], s):
-            for j in range(0, mask.shape[1], s):
-                block = B[i:i+s, j:j+s]
-                if block.size and block.any():
-                    cnt += 1
-        sizes.append(s)
-        counts.append(cnt if cnt>0 else 1)
-        s *= 2
-        max_scales += 1
-        if max_scales > 6:
-            break
-    if len(sizes) < 2:
-        return np.nan
-    x = -np.log(np.array(sizes))
-    y = np.log(np.array(counts))
-    A = np.vstack([x, np.ones_like(x)]).T
-    coeff, *_ = np.linalg.lstsq(A, y, rcond=None)
-    return float(coeff[0])

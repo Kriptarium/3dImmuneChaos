@@ -1,5 +1,5 @@
 
-import os, json
+import os, re
 import numpy as np
 from skimage import io, filters, morphology, measure, segmentation, exposure, util
 from skimage.restoration import rolling_ball
@@ -58,6 +58,53 @@ def texture_index(img, mask):
     mean = float(np.mean(vals)) if np.mean(vals)>0 else np.nan
     return float(var/mean) if (mean and np.isfinite(mean)) else float("nan")
 
+# ---------- MULTI-CHANNEL GROUPING ----------
+ROLE_PATTERNS = {
+    "dapi": re.compile(r"(dapi|hoechst|nuc(lei|clear)?)", re.I),
+    "immune": re.compile(r"(cd3|cd8|immune|t[-_ ]?cell|tcell)", re.I),
+    "tumor": re.compile(r"(phase|bf|bright|tumor|ck|actin)", re.I),
+}
+
+def guess_role_from_name(name):
+    for role, pat in ROLE_PATTERNS.items():
+        if pat.search(name):
+            return role
+    return "unknown"
+
+def canonical_stem(name):
+    # remove role tokens to derive a common stem
+    tokens = ["dapi","hoechst","nuclei","nuclear","nuc","cd3","cd8","immune","tcell","t-cell","phase","bf","bright","tumor","ck","actin"]
+    s = name.lower()
+    for t in tokens:
+        s = re.sub(rf"([_\-\s])?{t}([_\-\s])?", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or name
+
+def group_multichannel(files):
+    groups = {}
+    for p in files:
+        base = os.path.splitext(os.path.basename(p))[0]
+        role = guess_role_from_name(base)
+        stem = canonical_stem(base)
+        g = groups.setdefault(stem, {"all": []})
+        g["all"].append(p)
+        if role != "unknown":
+            g[role] = p
+    return groups
+
+# ---------- PROCESS ONE ENTRY ----------
+def safe_imread(path):
+    if path is None:
+        raise ValueError("No path provided")
+    if not isinstance(path, str):
+        path = str(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    img = io.imread(path)
+    if img is None:
+        raise IOError(f"Failed to read: {path}")
+    return img
+
 def overlay_png(base_img, mask, rim, dpi=200):
     import matplotlib.pyplot as plt
     from io import BytesIO
@@ -74,37 +121,13 @@ def overlay_png(base_img, mask, rim, dpi=200):
     buf.seek(0)
     return buf.read()
 
-def guess_role_from_name(name):
-    lname = name.lower()
-    if any(k in lname for k in ["dapi", "hoechst", "nuc"]):
-        return "dapi"
-    if any(k in lname for k in ["cd3", "cd8", "immune", "tcell", "t-cell"]):
-        return "immune"
-    if any(k in lname for k in ["phase", "bf", "bright", "tumor", "ck", "actin"]):
-        return "tumor"
-    return "unknown"
-
-def group_multichannel(files):
-    groups = {}
-    for p in files:
-        base = os.path.splitext(os.path.basename(p))[0]
-        role = guess_role_from_name(base)
-        stem = base
-        tokens = ["_dapi","-dapi"," dapi","_immune","-immune"," immune","_cd3","_cd8","-cd3","-cd8","_phase","-phase"," phase","_bf","-bf"," bf","_tumor","-tumor"," tumor"]
-        low = stem.lower()
-        for t in tokens:
-            low = low.replace(t, "")
-        stem = low
-        if stem not in groups:
-            groups[stem] = {}
-        groups[stem][role] = p
-        groups[stem].setdefault("all", []).append(p)
-    return groups
-
 def process_entry(entry, px_per_micron, rim_width_microns, prefer_channel="tumor"):
-    from skimage import io, filters, measure
-    base_path = entry.get(prefer_channel) or entry.get("tumor") or next(iter(entry.get("all",[None])))
-    img = io.imread(base_path)
+    # choose base channel
+    base_path = entry.get(prefer_channel) or entry.get("tumor") or (entry.get("all")[0] if entry.get("all") else None)
+    if base_path is None:
+        raise ValueError("No valid image found for this group (missing base channel).")
+    img = safe_imread(base_path)
+    from skimage import util as _util, filters, measure
     base_img = _to_gray(img)
     base_img_bs = background_subtract(base_img, radius_px=int(50/px_per_micron))
 
@@ -123,27 +146,31 @@ def process_entry(entry, px_per_micron, rim_width_microns, prefer_channel="tumor
     immune_boundary = immune_core = immune_infiltration = np.nan
     radial_immune = None
     if "immune" in entry:
-        im = io.imread(entry["immune"])
-        from skimage import util as _util
-        im = _util.img_as_float(im.mean(axis=-1)) if im.ndim==3 else _util.img_as_float(im)
-        im_bs = background_subtract(im, radius_px=int(50/px_per_micron))
-        immune_boundary = float(im_bs[rim].mean()) if rim.any() else np.nan
-        immune_core = float(im_bs[core].mean()) if core.any() else np.nan
-        immune_infiltration = float(immune_core/immune_boundary) if (np.isfinite(immune_core) and np.isfinite(immune_boundary) and immune_boundary>0) else np.nan
-        radial_immune = radial_profile(im_bs, mask, n_bins=50)
+        try:
+            im = safe_imread(entry["immune"])
+            im = _to_gray(im)
+            im_bs = background_subtract(im, radius_px=int(50/px_per_micron))
+            immune_boundary = float(im_bs[rim].mean()) if rim.any() else np.nan
+            immune_core = float(im_bs[core].mean()) if core.any() else np.nan
+            immune_infiltration = float(immune_core/immune_boundary) if (np.isfinite(immune_core) and np.isfinite(immune_boundary) and immune_boundary>0) else np.nan
+            radial_immune = radial_profile(im_bs, mask, n_bins=50)
+        except Exception:
+            pass
 
     nuclei_count = nuclei_density = np.nan
     if "dapi" in entry:
-        d = io.imread(entry["dapi"])
-        from skimage import util as _util
-        d = _util.img_as_float(d.mean(axis=-1)) if d.ndim==3 else _util.img_as_float(d)
-        d_bs = background_subtract(d, radius_px=int(50/px_per_micron))
-        th = filters.threshold_otsu(d_bs[mask]) if mask.any() else filters.threshold_otsu(d_bs)
-        bw = (d_bs > th) & mask
-        lab = measure.label(bw)
-        nuclei_count = int(lab.max())
-        area = mask.sum()
-        nuclei_density = float(nuclei_count/area) if area>0 else np.nan
+        try:
+            d = safe_imread(entry["dapi"])
+            d = _to_gray(d)
+            d_bs = background_subtract(d, radius_px=int(50/px_per_micron))
+            th = filters.threshold_otsu(d_bs[mask]) if mask.any() else filters.threshold_otsu(d_bs)
+            bw = (d_bs > th) & mask
+            lab = measure.label(bw)
+            nuclei_count = int(lab.max())
+            area = mask.sum()
+            nuclei_density = float(nuclei_count/area) if area>0 else np.nan
+        except Exception:
+            pass
 
     ov_png = overlay_png(base_img_bs, mask, rim)
     row = {
